@@ -1,12 +1,12 @@
 {
   "name": "n8n-nodes-lightning-network",
-  "version": "1.0.0",
-  "description": "n8n node for Lightning Network (LND)",
+  "version": "1.1.0",
+  "description": "Advanced n8n node for Lightning Network (LND) - routing, fees, channels, payments, rebalancing & monitoring",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc && gulp build:icons"
   },
-  "keywords": ["n8n-community-node-package", "n8n", "lightning", "lnd", "bitcoin"],
+  "keywords": ["n8n-community-node-package", "n8n", "lightning", "lnd", "bitcoin", "lightning-network", "routing", "fees"],
   "n8n": {
     "n8nNodesApiVersion": 1,
     "credentials": [
