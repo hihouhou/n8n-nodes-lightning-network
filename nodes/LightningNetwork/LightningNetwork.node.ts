@@ -236,6 +236,11 @@ export class LightningNetwork implements INodeType {
 						value: 'rebalance',
 						description: 'Channel rebalancing',
 					},
+					{
+						name: 'Wallet',
+						value: 'wallet',
+						description: 'On-chain wallet, UTXO management & dust protection',
+					},
 				],
 				default: 'node',
 			},
@@ -514,6 +519,42 @@ export class LightningNetwork implements INodeType {
 					},
 				],
 				default: 'suggestRebalances',
+			},
+
+			// ========== WALLET OPERATIONS ==========
+			{
+				displayName: 'Operation',
+				name: 'operation',
+				type: 'options',
+				noDataExpression: true,
+				displayOptions: { show: { resource: ['wallet'] } },
+				options: [
+					{
+						name: 'List UTXOs',
+						value: 'listUtxos',
+						description: 'List all unspent transaction outputs',
+						action: 'List all unspent transaction outputs',
+					},
+					{
+						name: 'Detect Dust UTXOs',
+						value: 'detectDustUtxos',
+						description: 'Detect dust UTXOs that may be from dust attacks',
+						action: 'Detect dust UTXOs that may be from dust attacks',
+					},
+					{
+						name: 'Freeze UTXO (Lease)',
+						value: 'leaseOutput',
+						description: 'Freeze a UTXO to prevent it from being spent',
+						action: 'Freeze a UTXO to prevent it from being spent',
+					},
+					{
+						name: 'Unfreeze UTXO (Release)',
+						value: 'releaseOutput',
+						description: 'Unfreeze a previously frozen UTXO',
+						action: 'Unfreeze a previously frozen UTXO',
+					},
+				],
+				default: 'listUtxos',
 			},
 
 			// =============================================
@@ -1006,6 +1047,62 @@ export class LightningNetwork implements INodeType {
 				default: 20,
 				displayOptions: { show: { resource: ['rebalance'], operation: ['suggestRebalances'] } },
 				description: 'Minimum deviation from target to suggest rebalance',
+			},
+
+			// --- Wallet: Detect Dust UTXOs ---
+			{
+				displayName: 'Dust Threshold (Sats)',
+				name: 'utxoDustThreshold',
+				type: 'number',
+				default: 1000,
+				displayOptions: { show: { resource: ['wallet'], operation: ['detectDustUtxos'] } },
+				description: 'UTXOs below this amount (sats) are considered dust',
+			},
+			{
+				displayName: 'Auto-Freeze Dust',
+				name: 'autoFreezeDust',
+				type: 'boolean',
+				default: false,
+				displayOptions: { show: { resource: ['wallet'], operation: ['detectDustUtxos'] } },
+				description: 'Automatically lease (freeze) detected dust UTXOs',
+			},
+			{
+				displayName: 'Freeze Duration (Seconds)',
+				name: 'freezeDuration',
+				type: 'number',
+				default: 2592000,
+				displayOptions: { show: { resource: ['wallet'], operation: ['detectDustUtxos'], autoFreezeDust: [true] } },
+				description: 'Duration to freeze dust UTXOs (default: 30 days)',
+			},
+
+			// --- Wallet: Lease Output (Freeze) ---
+			{
+				displayName: 'Outpoint (txid:index)',
+				name: 'leaseOutpoint',
+				type: 'string',
+				default: '',
+				required: true,
+				displayOptions: { show: { resource: ['wallet'], operation: ['leaseOutput'] } },
+				description: 'UTXO to freeze in format txid:output_index',
+			},
+			{
+				displayName: 'Lease Duration (Seconds)',
+				name: 'leaseDuration',
+				type: 'number',
+				default: 2592000,
+				displayOptions: { show: { resource: ['wallet'], operation: ['leaseOutput'] } },
+				description: 'How long to freeze this UTXO (default: 30 days = 2592000s)',
+			},
+
+			// --- Wallet: Release Output (Unfreeze) ---
+			{
+				displayName: 'Outpoint (txid:index)',
+				name: 'releaseOutpoint',
+				type: 'string',
+				default: '',
+				required: true,
+				displayOptions: { show: { resource: ['wallet'], operation: ['releaseOutput'] } },
+				description: 'UTXO to unfreeze in format txid:output_index',
 			},
 		],
 	};
@@ -1847,6 +1944,170 @@ export class LightningNetwork implements INodeType {
 							amount_sat: amount,
 							max_fee_sat: maxFee,
 							payment_result: payResult,
+						};
+					}
+				}
+
+				// ============ WALLET ============
+				else if (resource === 'wallet') {
+					if (operation === 'listUtxos') {
+						// Use walletkit ListUnspent - min_confs=0 to get all
+						const utxosResp = await lndRequest(
+							this, 'POST', '/v2/wallet/utxos',
+							{ min_confs: 0, max_confs: 2147483647 },
+							restHost, macaroon, tlsCert,
+						);
+
+						const utxos = (utxosResp.utxos || []).map((u: any) => ({
+							txid: u.outpoint?.txid_str || '',
+							output_index: u.outpoint?.output_index || 0,
+							outpoint: `${u.outpoint?.txid_str || ''}:${u.outpoint?.output_index || 0}`,
+							amount_sat: parseInt(u.amount_sat || '0'),
+							address: u.address || '',
+							address_type: u.address_type || '',
+							confirmations: parseInt(u.confirmations || '0'),
+							pk_script: u.pk_script || '',
+						}));
+
+						const totalBalance = utxos.reduce((s: number, u: any) => s + u.amount_sat, 0);
+
+						responseData = {
+							total_utxos: utxos.length,
+							total_balance_sat: totalBalance,
+							total_balance_btc: (totalBalance / 100000000).toFixed(8),
+							utxos,
+						};
+					} else if (operation === 'detectDustUtxos') {
+						const dustThreshold = this.getNodeParameter('utxoDustThreshold', i) as number;
+						const autoFreeze = this.getNodeParameter('autoFreezeDust', i) as boolean;
+
+						const utxosResp = await lndRequest(
+							this, 'POST', '/v2/wallet/utxos',
+							{ min_confs: 0, max_confs: 2147483647 },
+							restHost, macaroon, tlsCert,
+						);
+
+						const allUtxos = utxosResp.utxos || [];
+						const dustUtxos = allUtxos.filter((u: any) => parseInt(u.amount_sat || '0') <= dustThreshold);
+						const normalUtxos = allUtxos.filter((u: any) => parseInt(u.amount_sat || '0') > dustThreshold);
+
+						const dustDetails = dustUtxos.map((u: any) => ({
+							txid: u.outpoint?.txid_str || '',
+							output_index: u.outpoint?.output_index || 0,
+							outpoint: `${u.outpoint?.txid_str || ''}:${u.outpoint?.output_index || 0}`,
+							amount_sat: parseInt(u.amount_sat || '0'),
+							address: u.address || '',
+							confirmations: parseInt(u.confirmations || '0'),
+							risk: 'dust_attack_likely',
+							recommendation: 'Do NOT spend - freeze this UTXO',
+						}));
+
+						const frozenResults: any[] = [];
+						if (autoFreeze && dustDetails.length > 0) {
+							const freezeDuration = this.getNodeParameter('freezeDuration', i) as number;
+							// Generate a unique lease ID
+							const leaseId = Buffer.from('n8n-dust-protect').toString('base64');
+
+							for (const dust of dustUtxos) {
+								try {
+									const txidBytes = Buffer.from(dust.outpoint?.txid_str || '', 'hex').toString('base64');
+									await lndRequest(
+										this, 'POST', '/v2/wallet/utxos/lease',
+										{
+											id: leaseId,
+											outpoint: {
+												txid_bytes: txidBytes,
+												output_index: dust.outpoint?.output_index || 0,
+											},
+											expiration_seconds: freezeDuration.toString(),
+										},
+										restHost, macaroon, tlsCert,
+									);
+									frozenResults.push({
+										outpoint: `${dust.outpoint?.txid_str}:${dust.outpoint?.output_index}`,
+										status: 'frozen',
+										lease_duration_seconds: freezeDuration,
+										lease_duration_days: Math.round(freezeDuration / 86400),
+									});
+								} catch (leaseErr: any) {
+									frozenResults.push({
+										outpoint: `${dust.outpoint?.txid_str}:${dust.outpoint?.output_index}`,
+										status: 'freeze_failed',
+										error: leaseErr.message || 'Unknown error',
+									});
+								}
+							}
+						}
+
+						const totalDustAmount = dustDetails.reduce((s: number, d: any) => s + d.amount_sat, 0);
+						const totalNormalAmount = normalUtxos.reduce((s: number, u: any) => s + parseInt(u.amount_sat || '0'), 0);
+
+						responseData = {
+							dust_threshold_sat: dustThreshold,
+							total_utxos: allUtxos.length,
+							dust_utxos_count: dustDetails.length,
+							normal_utxos_count: normalUtxos.length,
+							dust_total_sat: totalDustAmount,
+							normal_total_sat: totalNormalAmount,
+							alert: dustDetails.length > 0
+								? `${dustDetails.length} dust UTXO(s) detected (${totalDustAmount} sats) - potential dust attack`
+								: 'No dust UTXOs detected',
+							auto_freeze_enabled: autoFreeze,
+							frozen_results: frozenResults.length > 0 ? frozenResults : undefined,
+							dust_utxos: dustDetails,
+						};
+					} else if (operation === 'leaseOutput') {
+						const outpoint = this.getNodeParameter('leaseOutpoint', i) as string;
+						const duration = this.getNodeParameter('leaseDuration', i) as number;
+						const [txid, outputIndexStr] = outpoint.split(':');
+						const outputIndex = parseInt(outputIndexStr);
+
+						const leaseId = Buffer.from('n8n-freeze').toString('base64');
+						const txidBytes = Buffer.from(txid, 'hex').toString('base64');
+
+						const result = await lndRequest(
+							this, 'POST', '/v2/wallet/utxos/lease',
+							{
+								id: leaseId,
+								outpoint: {
+									txid_bytes: txidBytes,
+									output_index: outputIndex,
+								},
+								expiration_seconds: duration.toString(),
+							},
+							restHost, macaroon, tlsCert,
+						);
+
+						responseData = {
+							outpoint,
+							status: 'frozen',
+							lease_duration_seconds: duration,
+							lease_duration_days: Math.round(duration / 86400),
+							expiration: result.expiration || 'unknown',
+						};
+					} else if (operation === 'releaseOutput') {
+						const outpoint = this.getNodeParameter('releaseOutpoint', i) as string;
+						const [txid, outputIndexStr] = outpoint.split(':');
+						const outputIndex = parseInt(outputIndexStr);
+
+						const leaseId = Buffer.from('n8n-freeze').toString('base64');
+						const txidBytes = Buffer.from(txid, 'hex').toString('base64');
+
+						await lndRequest(
+							this, 'POST', '/v2/wallet/utxos/release',
+							{
+								id: leaseId,
+								outpoint: {
+									txid_bytes: txidBytes,
+									output_index: outputIndex,
+								},
+							},
+							restHost, macaroon, tlsCert,
+						);
+
+						responseData = {
+							outpoint,
+							status: 'unfrozen',
 						};
 					}
 				}
